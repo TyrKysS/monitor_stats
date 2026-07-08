@@ -1,6 +1,6 @@
 name: "Entity Logger"
 description: "Loguje stav vybraných entit do CSV souboru a umožňuje jejich stažení jedním kliknutím"
-version: "1.0.0"
+version: "1.0.1"
 slug: "monitor_stats"
 init: false
 arch:
