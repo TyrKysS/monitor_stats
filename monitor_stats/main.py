@@ -24,29 +24,43 @@ DATA_DIR = Path("/data")
 CSV_FILE = DATA_DIR / "entity_log.csv"
 CONFIG_FILE = DATA_DIR / "user_config.json"
 OPTIONS_FILE = DATA_DIR / "options.json"
+STATE_FILE = DATA_DIR / "logging_state.json"
 
-PRIORITY_DOMAINS = ["sensor", "input_number", "light", "binary_sensor", "switch",
-                    "climate", "cover", "fan", "media_player"]
+PRIORITY_DOMAINS = [
+    "sensor", "input_number", "light", "binary_sensor",
+    "switch", "climate", "cover", "fan", "media_player",
+]
 DOMAIN_LABELS = {
     "sensor": "Senzory",
     "input_number": "Input Number (pomocníci)",
     "light": "Světla",
     "binary_sensor": "Binární senzory",
     "switch": "Přepínače",
-    "climate": "Klimatizace",
+    "climate": "Klimatizace / topení",
     "cover": "Rolovací prvky",
     "fan": "Ventilátory",
     "media_player": "Přehrávače",
 }
 
 
-def domain_to_type(entity_id: str) -> str:
-    domain = entity_id.split(".")[0]
-    return {"light": "light", "input_number": "input_number"}.get(domain, "sensor")
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def load_logging_state() -> bool:
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f).get("active", True)
+    except Exception:
+        return True
+
+
+def save_logging_state(active: bool) -> None:
+    with open(STATE_FILE, "w") as f:
+        json.dump({"active": active}, f)
 
 
 def load_config() -> dict:
-    """Prefer user_config.json, fall back to options.json from supervisor."""
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -66,8 +80,16 @@ def save_config(entities: list) -> None:
     logger.info(f"Konfigurace uložena ({len(entities)} entit)")
 
 
+# ---------------------------------------------------------------------------
+# Value helpers
+# ---------------------------------------------------------------------------
+
+def domain_to_type(entity_id: str) -> str:
+    domain = entity_id.split(".")[0]
+    return {"light": "light", "input_number": "input_number"}.get(domain, "sensor")
+
+
 def get_entity_value(entity_config: dict, state_data: dict | None):
-    """Vrátí (hodnota, jednotka)."""
     if state_data is None:
         return "unavailable", ""
     entity_type = entity_config.get("type", "sensor")
@@ -87,20 +109,21 @@ def get_entity_value(entity_config: dict, state_data: dict | None):
 def format_size(size_bytes: int) -> str:
     if size_bytes < 1024:
         return f"{size_bytes} B"
-    elif size_bytes < 1024 ** 2:
+    if size_bytes < 1024 ** 2:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes / 1024 ** 2:.2f} MB"
 
 
 # ---------------------------------------------------------------------------
-# Entity logger core
+# Core logger
 # ---------------------------------------------------------------------------
 
 class EntityLogger:
-    def __init__(self, entities: list):
+    def __init__(self, entities: list, logging_active: bool = True):
         self.entities = entities
         self.entity_ids: set = {e["entity_id"] for e in entities}
         self.current_states: dict = {}
+        self.logging_active = logging_active
         self.running = True
         self.record_count = self._count_records()
 
@@ -135,6 +158,8 @@ class EntityLogger:
                         logger.error(f"Chyba načítání {eid}: {e}")
 
     def write_log_entry(self, trigger_entity_id: str) -> None:
+        if not self.logging_active:
+            return
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         file_exists = CSV_FILE.exists()
         try:
@@ -195,11 +220,11 @@ class EntityLogger:
                     raise RuntimeError(f"Autentizace selhala: {msg}")
                 logger.info("Připojen k Home Assistant")
                 await ws.send_json({
-                    "id": 1, "type": "subscribe_events", "event_type": "state_changed",
+                    "id": 1, "type": "subscribe_events",
+                    "event_type": "state_changed",
                 })
                 await ws.receive_json()
                 logger.info("Přihlášen k odběru state_changed")
-
                 async for msg in ws:
                     if msg.type != aiohttp.WSMsgType.TEXT:
                         continue
@@ -213,12 +238,12 @@ class EntityLogger:
                     new_state = event_data.get("new_state")
                     if new_state:
                         self.current_states[entity_id] = new_state
-                    logger.info(f"Změna: {entity_id}")
+                    logger.info(f"Změna: {entity_id} — logging_active={self.logging_active}")
                     self.write_log_entry(entity_id)
 
 
 # ---------------------------------------------------------------------------
-# Helpers for fetching all HA entities (for config page)
+# Helpers for entity picker (config page)
 # ---------------------------------------------------------------------------
 
 async def fetch_all_entities() -> list[dict]:
@@ -249,67 +274,89 @@ def build_select_options(all_states: list[dict], selected_id: str = "") -> str:
         for s in groups[domain]:
             eid = s["entity_id"]
             fname = s.get("attributes", {}).get("friendly_name", eid)
-            sel = ' selected' if eid == selected_id else ''
-            fname_esc = fname.replace('"', '&quot;').replace('<', '&lt;')
-            eid_esc = eid.replace('"', '&quot;')
+            sel = " selected" if eid == selected_id else ""
+            fname_esc = fname.replace('"', "&quot;").replace("<", "&lt;")
+            eid_esc = eid.replace('"', "&quot;")
             html += (
-                f'<option value="{eid_esc}"'
-                f' data-name="{fname_esc}"{sel}>'
-                f'{fname} ({eid})</option>'
+                f'<option value="{eid_esc}" data-name="{fname_esc}"{sel}>'
+                f"{fname} ({eid})</option>"
             )
-        html += '</optgroup>'
+        html += "</optgroup>"
     return html
 
 
+def _row_html(options_html: str, selected_id: str = "", name: str = "") -> str:
+    safe_name = name.replace('"', "&quot;")
+    return (
+        f'<div class="entity-row">'
+        f'<select name="entity_id" onchange="autoName(this)">{options_html}</select>'
+        f'<input name="name" type="text" placeholder="Vlastní název (volitelný)" value="{safe_name}">'
+        f'<button type="button" class="btn-rm"'
+        f' onclick="this.parentElement.remove()" title="Odebrat">&#215;</button>'
+        f"</div>"
+    )
+
+
 # ---------------------------------------------------------------------------
-# HTML templates
+# HTML — INDEX (100 % statická stránka, vše dynamické řeší JS přes /api/status)
 # ---------------------------------------------------------------------------
 
-BASE_STYLE = """
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:sans-serif;background:#f0f4f8;color:#333;padding:24px}
-  h1{color:#03a9f4;margin-bottom:6px}
-  nav{margin-bottom:24px}
-  nav a{display:inline-block;padding:7px 16px;border-radius:6px;
-        text-decoration:none;color:#555;font-size:14px}
-  nav a.active{background:#03a9f4;color:#fff}
-  nav a:hover:not(.active){background:#e0e0e0}
-  h2{margin:24px 0 10px;color:#555}
-  .cards{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}
-  .card{background:#fff;border-radius:10px;padding:18px 24px;
-        box-shadow:0 2px 6px rgba(0,0,0,.08);min-width:160px}
-  .card .label{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.5px}
-  .card .value{font-size:28px;font-weight:700;margin-top:4px;color:#03a9f4}
-  .card .value.warn{color:#f57c00}
-  .btns{display:flex;gap:12px;flex-wrap:wrap}
-  .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 20px;
-       border-radius:8px;text-decoration:none;color:#fff;font-size:15px;
-       border:none;cursor:pointer;font-family:inherit}
-  .btn-dl{background:#03a9f4}.btn-clear{background:#ef5350}
-  .btn-save{background:#43a047}.btn-add{background:#7e57c2;margin-top:12px}
-  .btn:hover{filter:brightness(.9)}
-  table{width:100%;border-collapse:collapse;background:#fff;
-        border-radius:10px;overflow:hidden;box-shadow:0 2px 6px rgba(0,0,0,.08)}
-  th{background:#03a9f4;color:#fff;padding:10px 14px;text-align:left;font-weight:600}
-  td{padding:10px 14px;border-bottom:1px solid #eee}
-  tr:last-child td{border-bottom:none}
-  .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600}
-  .sensor{background:#e3f2fd;color:#0288d1}
-  .light{background:#fff9c4;color:#f9a825}
-  .input_number{background:#e8f5e9;color:#388e3c}
-  .unavail{color:#bbb;font-style:italic}
-  .notice{background:#fff3e0;border-left:4px solid #ff9800;
-          padding:12px 16px;border-radius:6px;margin-bottom:20px}
-"""
-
-INDEX_HTML = """\
-<!DOCTYPE html>
+INDEX_HTML = """<!DOCTYPE html>
 <html lang="cs">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Entity Logger</title>
-  <style>{style}</style>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:sans-serif;background:#f0f4f8;color:#333;padding:24px}
+    h1{color:#03a9f4;margin-bottom:6px}
+    nav{margin-bottom:20px}
+    nav a{display:inline-block;padding:7px 16px;border-radius:6px;
+          text-decoration:none;color:#555;font-size:14px}
+    nav a.active{background:#03a9f4;color:#fff}
+    nav a:hover:not(.active){background:#e0e0e0}
+    h2{margin:24px 0 10px;color:#555;font-size:16px}
+    .notice{background:#fff3e0;border-left:4px solid #ff9800;
+            padding:12px 16px;border-radius:6px;margin-bottom:20px;display:none}
+    .notice a{color:#e65100}
+    .status-bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+                background:#fff;border-radius:10px;padding:14px 20px;
+                margin-bottom:20px;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+    .status-ind{font-size:15px;font-weight:700;flex:1}
+    .status-ind.active{color:#43a047}
+    .status-ind.stopped{color:#ef5350}
+    .status-ind.connecting{color:#fb8c00}
+    .cards{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px}
+    .card{background:#fff;border-radius:10px;padding:16px 22px;
+          box-shadow:0 2px 6px rgba(0,0,0,.08);min-width:150px}
+    .card .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px}
+    .card .value{font-size:26px;font-weight:700;margin-top:4px;color:#03a9f4}
+    .card .value.warn{color:#f57c00}
+    .btns{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px}
+    .btn{display:inline-flex;align-items:center;gap:7px;padding:10px 18px;
+         border-radius:8px;text-decoration:none;color:#fff;font-size:14px;
+         border:none;cursor:pointer;font-family:inherit;font-weight:600;
+         transition:filter .15s}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .btn:not(:disabled):hover{filter:brightness(.88)}
+    .btn-start{background:#43a047}
+    .btn-stop{background:#ef5350}
+    .btn-dl{background:#03a9f4}
+    .btn-clear{background:#757575}
+    table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;
+          overflow:hidden;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+    th{background:#03a9f4;color:#fff;padding:10px 14px;text-align:left;font-weight:600;font-size:13px}
+    td{padding:10px 14px;border-bottom:1px solid #eee;font-size:13px}
+    tr:last-child td{border-bottom:none}
+    .badge{display:inline-block;padding:2px 9px;border-radius:12px;
+           font-size:11px;font-weight:700}
+    .sensor{background:#e3f2fd;color:#0288d1}
+    .light{background:#fff9c4;color:#f9a825}
+    .input_number{background:#e8f5e9;color:#388e3c}
+    .unavail{color:#bbb;font-style:italic}
+    .ts{font-size:11px;color:#aaa;margin-top:6px}
+  </style>
 </head>
 <body>
   <h1>Entity Logger</h1>
@@ -318,38 +365,166 @@ INDEX_HTML = """\
     <a href="config">Konfigurace entit</a>
   </nav>
 
-  {notice}
+  <div id="notice" class="notice">
+    &#9888; Nejsou nastaveny žádné entity.
+    <a href="config">Přejděte do Konfigurace</a> a vyberte, co chcete logovat.
+  </div>
 
+  <!-- Status + Start/Stop -->
+  <div class="status-bar">
+    <span id="status-ind" class="status-ind connecting">&#9679; Připojuji se...</span>
+    <button id="toggle-btn" class="btn btn-start" onclick="toggleLogging()" disabled>
+      &#9654; Spustit logování
+    </button>
+  </div>
+
+  <!-- Stats -->
   <div class="cards">
     <div class="card">
       <div class="label">Zaznamenaných řádků</div>
-      <div class="value">{record_count}</div>
+      <div class="value" id="stat-records">—</div>
     </div>
     <div class="card">
       <div class="label">Velikost souboru</div>
-      <div class="value {size_class}">{file_size}</div>
+      <div class="value" id="stat-size">—</div>
     </div>
     <div class="card">
       <div class="label">Volné místo na disku</div>
-      <div class="value {disk_class}">{disk_free}</div>
+      <div class="value" id="stat-disk">—</div>
     </div>
     <div class="card">
       <div class="label">Monitorované entity</div>
-      <div class="value">{entity_count}</div>
+      <div class="value" id="stat-entities">—</div>
     </div>
   </div>
 
-  <div class="btns" style="margin-bottom:24px">
+  <!-- Actions -->
+  <div class="btns">
     <a class="btn btn-dl" href="download">&#8675; Stáhnout CSV</a>
     <a class="btn btn-clear" href="clear"
        onclick="return confirm('Opravdu vymazat všechny záznamy?')">&#128465; Vymazat záznamy</a>
   </div>
 
-  <h2>Aktuální stav entit</h2>
-  {table}
+  <!-- Live entity table -->
+  <h2>Aktuální stav entit <span class="ts" id="last-update"></span></h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Entity ID</th>
+        <th>Název</th>
+        <th>Typ</th>
+        <th>Aktuální hodnota</th>
+      </tr>
+    </thead>
+    <tbody id="entity-tbody">
+      <tr><td colspan="4" style="color:#bbb;text-align:center;padding:20px">Načítám...</td></tr>
+    </tbody>
+  </table>
+
+  <script>
+    let isLogging = null;
+    let toggling = false;
+
+    function esc(s) {
+      return String(s)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function refresh() {
+      let d;
+      try {
+        d = await fetch('api/status').then(r => r.json());
+      } catch(e) {
+        document.getElementById('status-ind').textContent = '⚠ Nelze se připojit k doplňku';
+        document.getElementById('status-ind').className = 'status-ind stopped';
+        return;
+      }
+
+      // Notice
+      document.getElementById('notice').style.display =
+        d.entities.length === 0 ? 'block' : 'none';
+
+      // Status indicator + toggle button
+      const ind = document.getElementById('status-ind');
+      const btn = document.getElementById('toggle-btn');
+      isLogging = d.logging;
+      if (d.logging) {
+        ind.textContent = '● Logování aktivní';
+        ind.className = 'status-ind active';
+        btn.innerHTML = '■ Zastavit logování';
+        btn.className = 'btn btn-stop';
+      } else {
+        ind.textContent = '■ Logování zastaveno';
+        ind.className = 'status-ind stopped';
+        btn.innerHTML = '► Spustit logování';
+        btn.className = 'btn btn-start';
+      }
+      if (!toggling) btn.disabled = false;
+
+      // Stats
+      document.getElementById('stat-records').textContent =
+        d.record_count.toLocaleString('cs-CZ');
+      const sizeEl = document.getElementById('stat-size');
+      sizeEl.textContent = d.file_size;
+      sizeEl.className = 'value' + (d.file_size_warn ? ' warn' : '');
+      const diskEl = document.getElementById('stat-disk');
+      diskEl.textContent = d.disk_free;
+      diskEl.className = 'value' + (d.disk_warn ? ' warn' : '');
+      document.getElementById('stat-entities').textContent = d.entities.length;
+
+      // Entity table
+      const tbody = document.getElementById('entity-tbody');
+      if (d.entities.length === 0) {
+        tbody.innerHTML =
+          '<tr><td colspan="4" style="color:#bbb;text-align:center;padding:20px">' +
+          'Žádné entity &mdash; nastavte v <a href="config">Konfiguraci</a></td></tr>';
+      } else {
+        tbody.innerHTML = d.entities.map(function(e) {
+          var val;
+          if (e.value === 'unavailable') {
+            val = '<span class="unavail">nedostupná</span>';
+          } else {
+            val = '<b>' + esc(e.value) + '</b>' + (e.unit ? ' ' + esc(e.unit) : '');
+          }
+          return '<tr>' +
+            '<td><code>' + esc(e.entity_id) + '</code></td>' +
+            '<td>' + esc(e.name) + '</td>' +
+            '<td><span class="badge ' + esc(e.type) + '">' + esc(e.type) + '</span></td>' +
+            '<td>' + val + '</td>' +
+            '</tr>';
+        }).join('');
+      }
+
+      // Timestamp
+      const now = new Date();
+      document.getElementById('last-update').textContent =
+        'Aktualizováno ' + now.toLocaleTimeString('cs-CZ');
+    }
+
+    async function toggleLogging() {
+      if (toggling || isLogging === null) return;
+      toggling = true;
+      const btn = document.getElementById('toggle-btn');
+      btn.disabled = true;
+      const action = isLogging ? 'stop' : 'start';
+      try {
+        await fetch(action);
+      } catch(e) {}
+      await refresh();
+      toggling = false;
+    }
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
 </body>
-</html>
-"""
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# HTML — CONFIG PAGE (Python .format() pro entity picker)
+# ---------------------------------------------------------------------------
 
 CONFIG_HTML = """\
 <!DOCTYPE html>
@@ -357,21 +532,39 @@ CONFIG_HTML = """\
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Entity Logger – Konfigurace</title>
+  <title>Entity Logger &ndash; Konfigurace</title>
   <style>
-    {style}
-    .entity-row{{display:flex;gap:10px;align-items:center;
-                background:#fff;border-radius:8px;padding:10px 14px;
-                margin-bottom:8px;box-shadow:0 1px 4px rgba(0,0,0,.07)}}
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:sans-serif;background:#f0f4f8;color:#333;padding:24px}}
+    h1{{color:#03a9f4;margin-bottom:6px}}
+    nav{{margin-bottom:20px}}
+    nav a{{display:inline-block;padding:7px 16px;border-radius:6px;
+           text-decoration:none;color:#555;font-size:14px}}
+    nav a.active{{background:#03a9f4;color:#fff}}
+    nav a:hover:not(.active){{background:#e0e0e0}}
+    h2{{margin:0 0 12px;color:#555}}
+    p.desc{{color:#666;margin-bottom:20px;font-size:14px;line-height:1.5}}
+    .entity-row{{display:flex;gap:10px;align-items:center;background:#fff;
+                 border-radius:8px;padding:10px 14px;margin-bottom:8px;
+                 box-shadow:0 1px 4px rgba(0,0,0,.07)}}
     .entity-row select{{flex:2;padding:8px 10px;border:1px solid #ccc;
-                        border-radius:6px;font-size:14px}}
+                        border-radius:6px;font-size:13px;min-width:0}}
     .entity-row input{{flex:1;padding:8px 10px;border:1px solid #ccc;
-                       border-radius:6px;font-size:14px}}
+                       border-radius:6px;font-size:13px;min-width:0}}
     .btn-rm{{background:#ef5350;border:none;color:#fff;border-radius:6px;
-             padding:8px 12px;cursor:pointer;font-size:18px;line-height:1}}
-    .tip{{font-size:13px;color:#888;margin-top:16px}}
-    label.col{{font-size:12px;color:#888;flex:1;text-align:center}}
-    .header-row{{display:flex;gap:10px;padding:0 14px;margin-bottom:2px}}
+             padding:8px 13px;cursor:pointer;font-size:18px;line-height:1;
+             flex-shrink:0}}
+    .btn-rm:hover{{background:#c62828}}
+    .col-hdr{{font-size:11px;color:#888;text-transform:uppercase;
+              letter-spacing:.5px;flex:1}}
+    .header-row{{display:flex;gap:10px;padding:0 14px;margin-bottom:4px}}
+    .btn{{display:inline-flex;align-items:center;gap:7px;padding:11px 20px;
+          border-radius:8px;text-decoration:none;color:#fff;font-size:14px;
+          border:none;cursor:pointer;font-family:inherit;font-weight:600}}
+    .btn:hover{{filter:brightness(.88)}}
+    .btn-add{{background:#7e57c2;margin-top:14px}}
+    .btn-save{{background:#43a047;margin-top:20px}}
+    .tip{{font-size:12px;color:#aaa;margin-top:10px}}
   </style>
 </head>
 <body>
@@ -382,141 +575,124 @@ CONFIG_HTML = """\
   </nav>
 
   <h2>Vyberte entity k monitorování</h2>
-  <p style="margin-bottom:16px;color:#555">
-    Záznam se vytvoří pokaždé, když se změní <em>jakákoli</em> z vybraných entit —
-    v záznamu budou vždy hodnoty <em>všech</em> entit najednou.
+  <p class="desc">
+    Záznam vznikne při <strong>každé změně</strong> libovolné vybrané entity &mdash;
+    do CSV se vždy zapíší hodnoty <strong>všech</strong> entit najednou.
+    Po uložení se změny projeví okamžitě bez restartu.
   </p>
 
   <form method="POST" action="config">
     <div class="header-row">
-      <label class="col" style="flex:2;text-align:left">Entita</label>
-      <label class="col">Název v CSV</label>
-      <label class="col" style="flex:0 0 42px"></label>
+      <span class="col-hdr" style="flex:2">Entita</span>
+      <span class="col-hdr">Název v CSV</span>
+      <span style="flex:0 0 42px"></span>
     </div>
-    <div id="rows">
-      {rows}
-    </div>
+    <div id="rows">{rows}</div>
 
     <button type="button" class="btn btn-add" onclick="addRow()">+ Přidat entitu</button>
-
-    <div style="margin-top:20px">
-      <button type="submit" class="btn btn-save">&#10003; Uložit konfiguraci</button>
-    </div>
-    <p class="tip">Po uložení se změny projeví okamžitě — bez restartu doplňku.</p>
+    <br>
+    <button type="submit" class="btn btn-save">&#10003; Uložit konfiguraci</button>
+    <p class="tip">Změny se projeví okamžitě &mdash; bez restartu doplňku.</p>
   </form>
 
   <script>
-    const OPTIONS = `{options_html}`;
+    const OPTS = `{options_html}`;
 
     function makeRow(selectedId, name) {{
-      const div = document.createElement('div');
-      div.className = 'entity-row';
-      div.innerHTML =
-        '<select name="entity_id" onchange="autoName(this)">' +
-          OPTIONS +
-        '</select>' +
-        '<input name="name" type="text" placeholder="Vlastní název (volitelný)" value="' +
-          (name || '').replace(/"/g, '&quot;') + '">' +
-        '<button type="button" class="btn-rm" onclick="this.parentElement.remove()" title="Odebrat">&#215;</button>';
-      if (selectedId) {{
-        div.querySelector('select').value = selectedId;
-      }}
-      return div;
+      const d = document.createElement('div');
+      d.className = 'entity-row';
+      d.innerHTML =
+        '<select name="entity_id" onchange="autoName(this)">' + OPTS + '</select>' +
+        '<input name="name" type="text" placeholder="Vlastní název (volitelný)"' +
+          ' value="' + (name || '').replace(/"/g, '&quot;') + '">' +
+        '<button type="button" class="btn-rm"' +
+          ' onclick="this.parentElement.remove()" title="Odebrat">&#215;</button>';
+      if (selectedId) d.querySelector('select').value = selectedId;
+      return d;
     }}
 
-    function addRow(selectedId, name) {{
-      document.getElementById('rows').appendChild(makeRow(selectedId || '', name || ''));
+    function addRow(sel, name) {{
+      document.getElementById('rows').appendChild(makeRow(sel || '', name || ''));
     }}
 
     function autoName(sel) {{
       const inp = sel.parentElement.querySelector('input[name="name"]');
       if (!inp.value && sel.value) {{
-        const opt = sel.options[sel.selectedIndex];
-        inp.value = opt.dataset.name || sel.value;
+        inp.value = sel.options[sel.selectedIndex].dataset.name || sel.value;
       }}
     }}
   </script>
 </body>
-</html>
-"""
-
-
-def _row_html(options_html: str, selected_id: str = "", name: str = "") -> str:
-    safe_name = name.replace('"', '&quot;')
-    return (
-        f'<div class="entity-row">'
-        f'<select name="entity_id" onchange="autoName(this)">{options_html}</select>'
-        f'<input name="name" type="text" placeholder="Vlastní název (volitelný)" value="{safe_name}">'
-        f'<button type="button" class="btn-rm" '
-        f'onclick="this.parentElement.remove()" title="Odebrat">&#215;</button>'
-        f'</div>'
-    )
+</html>"""
 
 
 # ---------------------------------------------------------------------------
-# Web routes
+# Routes
 # ---------------------------------------------------------------------------
 
 def build_routes(entity_logger: EntityLogger):
     routes = web.RouteTableDef()
 
+    # -- Index (static HTML, JS fetches /api/status) -----------------------
     @routes.get("/")
     async def index(request):
-        file_size, size_class = "—", ""
+        return web.Response(text=INDEX_HTML, content_type="text/html")
+
+    # -- JSON status API ---------------------------------------------------
+    @routes.get("/api/status")
+    async def api_status(request):
+        file_size, file_size_warn = "—", False
         if CSV_FILE.exists():
             sz = CSV_FILE.stat().st_size
             file_size = format_size(sz)
-            size_class = "warn" if sz > 500 * 1024 * 1024 else ""
+            file_size_warn = sz > 500 * 1024 * 1024
+        disk_free, disk_warn = "N/A", False
         try:
             _, _, free = shutil.disk_usage("/data")
             disk_free = format_size(free)
-            disk_class = "warn" if free < 100 * 1024 * 1024 else ""
+            disk_warn = free < 100 * 1024 * 1024
         except Exception:
-            disk_free, disk_class = "N/A", ""
+            pass
 
-        notice = ""
-        if not entity_logger.entities:
-            notice = (
-                '<div class="notice">&#9888; Nejsou nastaveny žádné entity. '
-                '<a href="config">Přejděte do Konfigurace</a> a vyberte, co chcete logovat.</div>'
-            )
-
-        rows = []
+        entities = []
         for ec in entity_logger.entities:
-            state_data = entity_logger.current_states.get(ec["entity_id"])
-            value, unit = get_entity_value(ec, state_data)
-            val_html = (
-                f'<span class="unavail">nedostupná</span>'
-                if value == "unavailable"
-                else f'<b>{value}</b> {unit}'.strip()
+            value, unit = get_entity_value(
+                ec, entity_logger.current_states.get(ec["entity_id"])
             )
-            etype = ec.get("type", "sensor")
-            rows.append(
-                f"<tr>"
-                f"<td><code>{ec['entity_id']}</code></td>"
-                f"<td>{ec.get('name', '—')}</td>"
-                f"<td><span class='badge {etype}'>{etype}</span></td>"
-                f"<td>{val_html}</td></tr>"
-            )
-        table = (
-            "<table><tr><th>Entity ID</th><th>Název</th><th>Typ</th><th>Aktuální hodnota</th></tr>"
-            + ("\n".join(rows) if rows else "<tr><td colspan='4' style='color:#bbb;text-align:center'>Zatím žádné entity</td></tr>")
-            + "</table>"
-        )
+            entities.append({
+                "entity_id": ec["entity_id"],
+                "name": ec.get("name", ec["entity_id"]),
+                "type": ec.get("type", "sensor"),
+                "value": str(value),
+                "unit": unit,
+            })
 
-        html = INDEX_HTML.format(
-            style=BASE_STYLE,
-            notice=notice,
-            record_count=entity_logger.record_count,
-            file_size=file_size,
-            size_class=size_class,
-            disk_free=disk_free,
-            disk_class=disk_class,
-            entity_count=len(entity_logger.entities),
-            table=table,
-        )
-        return web.Response(text=html, content_type="text/html")
+        return web.json_response({
+            "logging": entity_logger.logging_active,
+            "record_count": entity_logger.record_count,
+            "file_size": file_size,
+            "file_size_warn": file_size_warn,
+            "disk_free": disk_free,
+            "disk_warn": disk_warn,
+            "entities": entities,
+        })
 
+    # -- Start / Stop ------------------------------------------------------
+    @routes.get("/start")
+    async def start_logging(request):
+        entity_logger.logging_active = True
+        save_logging_state(True)
+        logger.info("Logování spuštěno")
+        return web.json_response({"ok": True, "logging": True})
+
+    @routes.get("/stop")
+    async def stop_logging(request):
+        entity_logger.logging_active = False
+        save_logging_state(False)
+        logger.info("Logování zastaveno")
+        return web.json_response({"ok": True, "logging": False})
+
+    # -- Download / Clear --------------------------------------------------
     @routes.get("/download")
     async def download(request):
         if not CSV_FILE.exists():
@@ -535,28 +711,25 @@ def build_routes(entity_logger: EntityLogger):
             logger.info("Log soubor smazán")
         raise web.HTTPFound(".")
 
+    # -- Config page -------------------------------------------------------
     @routes.get("/config")
     async def config_page(request):
         all_states = await fetch_all_entities()
-        # Pre-select current entities
         rows_html = ""
         if entity_logger.entities:
             for ec in entity_logger.entities:
                 opts = build_select_options(all_states, ec["entity_id"])
                 rows_html += _row_html(opts, ec["entity_id"], ec.get("name", ""))
         else:
-            # One empty row to start
-            opts = build_select_options(all_states)
-            rows_html = _row_html(opts)
+            rows_html = _row_html(build_select_options(all_states))
 
-        # Options HTML for JS addRow()
-        js_options = build_select_options(all_states).replace("`", "\\`").replace("</", "<\\/")
-
-        html = CONFIG_HTML.format(
-            style=BASE_STYLE,
-            rows=rows_html,
-            options_html=js_options,
+        js_opts = (
+            build_select_options(all_states)
+            .replace("\\", "\\\\")
+            .replace("`", "\\`")
+            .replace("</", "<\\/")
         )
+        html = CONFIG_HTML.format(rows=rows_html, options_html=js_opts)
         return web.Response(text=html, content_type="text/html")
 
     @routes.post("/config")
@@ -564,9 +737,7 @@ def build_routes(entity_logger: EntityLogger):
         data = await request.post()
         entity_ids = data.getall("entity_id", [])
         names = data.getall("name", [])
-
-        entities = []
-        seen = set()
+        entities, seen = [], set()
         for i, eid in enumerate(entity_ids):
             eid = eid.strip()
             if not eid or eid in seen:
@@ -578,7 +749,6 @@ def build_routes(entity_logger: EntityLogger):
                 "name": name or eid,
                 "type": domain_to_type(eid),
             })
-
         save_config(entities)
         entity_logger.reload_config(entities)
         raise web.HTTPFound(".")
@@ -592,7 +762,8 @@ def build_routes(entity_logger: EntityLogger):
 
 async def main():
     config = load_config()
-    entity_logger = EntityLogger(config.get("entities", []))
+    logging_active = load_logging_state()
+    entity_logger = EntityLogger(config.get("entities", []), logging_active)
 
     app = web.Application()
     app.add_routes(build_routes(entity_logger))
@@ -602,7 +773,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Web UI běží na portu {port}")
+    logger.info(f"Web UI běží na portu {port}, logging_active={logging_active}")
 
     asyncio.create_task(entity_logger.run_websocket())
 
