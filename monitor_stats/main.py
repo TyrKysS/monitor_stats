@@ -166,15 +166,15 @@ class EntityLogger:
             with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if not file_exists:
-                    header = ["timestamp", "trigger_entity"]
+                    header = ["timestamp"]
                     header += [ec.get("name", ec["entity_id"]) for ec in self.entities]
                     writer.writerow(header)
-                row = [timestamp, trigger_entity_id]
+                row = [timestamp]
                 for ec in self.entities:
-                    value, unit = get_entity_value(
+                    value, _unit = get_entity_value(
                         ec, self.current_states.get(ec["entity_id"])
                     )
-                    row.append(f"{value} {unit}".strip() if unit else value)
+                    row.append(value)
                 writer.writerow(row)
             self.record_count += 1
         except OSError as e:
