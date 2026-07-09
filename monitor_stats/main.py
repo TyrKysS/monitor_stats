@@ -166,20 +166,17 @@ class EntityLogger:
             with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if not file_exists:
-                    writer.writerow([
-                        "timestamp", "trigger_entity",
-                        "entity_id", "name", "type", "value", "unit",
-                    ])
+                    header = ["timestamp", "trigger_entity"]
+                    header += [ec.get("name", ec["entity_id"]) for ec in self.entities]
+                    writer.writerow(header)
+                row = [timestamp, trigger_entity_id]
                 for ec in self.entities:
                     value, unit = get_entity_value(
                         ec, self.current_states.get(ec["entity_id"])
                     )
-                    writer.writerow([
-                        timestamp, trigger_entity_id,
-                        ec["entity_id"], ec.get("name", ec["entity_id"]),
-                        ec.get("type", "sensor"), value, unit,
-                    ])
-            self.record_count += len(self.entities)
+                    row.append(f"{value} {unit}".strip() if unit else value)
+                writer.writerow(row)
+            self.record_count += 1
         except OSError as e:
             logger.error(f"Chyba zápisu (disk plný?): {e}")
 
